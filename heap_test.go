@@ -53,7 +53,7 @@ func benchmarkHeapPop(b *testing.B, data []int) {
 		h2 = h2[:len(data)]
 		copy(h2, h1)
 		for len(h2) != 0 {
-			heap.Pop(&h2)
+			_ = heap.Pop(&h2).(int)
 		}
 	}
 }

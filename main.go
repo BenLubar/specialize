@@ -20,6 +20,14 @@ import (
 
 var iprog *loader.Program
 
+type Context struct {
+	Pkg  *types.Package
+	RTA  *rta.Result
+	Heap FuncCallHeap
+	Call *FuncCall
+	bytes.Buffer
+}
+
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("specialize: ")
@@ -37,39 +45,58 @@ func main() {
 	prog := ssa.Create(iprog, ssa.SanityCheckFunctions)
 	prog.BuildAll()
 
-	var functions []*ssa.Function
-
 	for _, ipkg := range iprog.InitialPackages() {
 		pkg := prog.Package(ipkg.Pkg)
+
+		var functions []*ssa.Function
 
 		for _, m := range pkg.Members {
 			if f, ok := m.(*ssa.Function); ok {
 				functions = append(functions, f)
 			}
 		}
-	}
 
-	result := rta.Analyze(functions, true)
-	var h FuncCallHeap
-	for _, f := range functions {
-		h = Analyze(f, result, h)
-	}
-
-	h.Init()
-
-	seen := make(map[string]bool)
-	for h.Len() != 0 {
-		fcall := h.Next()
-
-		if seen[fcall.Name()] {
-			continue
+		var ctx Context
+		ctx.RTA = rta.Analyze(functions, true)
+		ctx.Pkg = ipkg.Pkg
+		fcctx.Pkg = ipkg.Pkg
+		for _, f := range functions {
+			ctx.Analyze(f)
 		}
-		seen[fcall.Name()] = true
 
-		log.Println(fcall.Name())
-		Rewrite(&h, fcall)
+		ctx.Heap.Init()
+
+		ctx.WriteString("package ")
+		ctx.WriteString(ctx.Pkg.Name())
+		ctx.WriteByte('\n')
+
+		seen := make(map[string]bool)
+		for ctx.Heap.Len() != 0 {
+			ctx.Call = ctx.Heap.Next()
+
+			if seen[ctx.Call.Name()] {
+				continue
+			}
+			seen[ctx.Call.Name()] = true
+
+			log.Println(ctx.Call.Name())
+			Rewrite(&ctx)
+		}
+
+		b, err := format.Source(ctx.Bytes())
+		if err != nil {
+			panic(err)
+		}
+		_, err = os.Stdout.Write(b)
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Println()
 	}
 }
+
+var fcctx Context
 
 type FuncCall struct {
 	F    *ssa.Function
@@ -120,33 +147,31 @@ func (fc *FuncCall) Name() string {
 	}
 
 	name := []byte("specialized_")
-	var buf bytes.Buffer
 
-	ipkg := iprog.InitialPackages()[0].Pkg
-	if fc.F.Pkg.Object == ipkg {
+	if fc.F.Pkg.Object == fcctx.Pkg {
 		name = append(name, "_l"...)
 	} else {
 		name = mangle(name, fc.F.Pkg.Object.Name())
 		name = append(name, '_')
 	}
 	if recv := sig.Recv(); recv != nil {
-		buf.Reset()
-		writeType(&buf, ipkg, recv.Type(), nil)
-		name = mangle(name, buf.String())
+		fcctx.Reset()
+		fcctx.WriteType(recv.Type())
+		name = mangle(name, fcctx.String())
 		name = append(name, "_d"...)
 	}
 	name = mangle(name, fc.F.Name())
 	for _, v := range fc.Call {
 		name = append(name, "_a"...)
-		buf.Reset()
-		writeType(&buf, ipkg, v, nil)
-		name = mangle(name, buf.String())
+		fcctx.Reset()
+		fcctx.WriteType(v)
+		name = mangle(name, fcctx.String())
 	}
 	for _, v := range fc.Ret {
 		name = append(name, "_r"...)
-		buf.Reset()
-		writeType(&buf, ipkg, v, nil)
-		name = mangle(name, buf.String())
+		fcctx.Reset()
+		fcctx.WriteType(v)
+		name = mangle(name, fcctx.String())
 	}
 
 	fc.name = string(name)
@@ -170,7 +195,7 @@ func (h *FuncCallHeap) Init()            { heap.Init(h) }
 func (h *FuncCallHeap) Add(fc *FuncCall) { heap.Push(h, fc) }
 func (h *FuncCallHeap) Next() *FuncCall  { return heap.Pop(h).(*FuncCall) }
 
-func UsesReflection(n *callgraph.Node, seen map[int]bool) bool {
+func usesReflection(n *callgraph.Node, seen map[int]bool) bool {
 	if seen[n.ID] {
 		return false
 	}
@@ -179,14 +204,14 @@ func UsesReflection(n *callgraph.Node, seen map[int]bool) bool {
 		return true
 	}
 	for _, e := range n.Out {
-		if UsesReflection(e.Callee, seen) {
+		if usesReflection(e.Callee, seen) {
 			return true
 		}
 	}
 	return false
 }
 
-func Analyze(f *ssa.Function, result *rta.Result, h FuncCallHeap) FuncCallHeap {
+func (ctx *Context) Analyze(f *ssa.Function) {
 	for _, b := range f.Blocks {
 		for _, instr := range b.Instrs {
 			if cc, ok := instr.(ssa.CallInstruction); ok {
@@ -195,93 +220,111 @@ func Analyze(f *ssa.Function, result *rta.Result, h FuncCallHeap) FuncCallHeap {
 				if cf == nil {
 					continue
 				}
-				if UsesReflection(result.CallGraph.Nodes[cf], make(map[int]bool)) {
+				if usesReflection(ctx.RTA.CallGraph.Nodes[cf], make(map[int]bool)) {
 					continue
 				}
-				anyInterface := false
-				ret := c.Signature().Results()
-				call := &FuncCall{
-					F:    cf,
-					Call: make([]types.Type, len(c.Args)),
-				}
-				for i, v := range c.Args {
-					call.Call[i] = v.Type()
-					if m, ok := v.(*ssa.MakeInterface); ok {
-						anyInterface = true
-						call.Call[i] = m.X.Type()
-					}
-				}
-				if v, ok := instr.(ssa.Value); ok && ret.Len() == 1 {
-					ref := *v.Referrers()
-					if len(ref) > 0 {
-						if a, ok := ref[0].(*ssa.TypeAssert); ok && len(ref) == 1 && !a.CommaOk {
-							call.Ret = []types.Type{a.Type()}
-						} else {
-							for i, l := 0, ret.Len(); i < l; i++ {
-								call.Ret = append(call.Ret, ret.At(i).Type())
-							}
-						}
-					}
-				}
-				if anyInterface {
-					h = append(h, call)
+				if call := usesInterface(cc, cf); call != nil {
+					ctx.Heap = append(ctx.Heap, call)
 				}
 			}
 		}
 	}
-	return h
 }
 
-func writeName(buf *bytes.Buffer, pkg *types.Package, val ssa.Value) {
+func usesInterface(cc ssa.CallInstruction, cf *ssa.Function) *FuncCall {
+	c := cc.Common()
+
+	anyInterface := false
+	ret := c.Signature().Results()
+
+	call := &FuncCall{
+		F:    cf,
+		Call: make([]types.Type, len(c.Args)),
+	}
+	for i, v := range c.Args {
+		call.Call[i] = v.Type()
+		if m, ok := v.(*ssa.MakeInterface); ok {
+			anyInterface = true
+			call.Call[i] = m.X.Type()
+		}
+	}
+	if v, ok := cc.(ssa.Value); ok && ret.Len() > 0 {
+		ref := *v.Referrers()
+		if len(ref) > 0 {
+			if a, ok := ref[0].(*ssa.TypeAssert); ok && len(ref) == 1 && !a.CommaOk {
+				call.Ret = []types.Type{a.Type()}
+			} else {
+				for i, l := 0, ret.Len(); i < l; i++ {
+					call.Ret = append(call.Ret, ret.At(i).Type())
+				}
+			}
+		}
+	}
+
+	if anyInterface {
+		return call
+	}
+	return nil
+}
+
+func (ctx *Context) WriteNumber(n int) {
+	ctx.WriteString(strconv.Itoa(n))
+}
+
+func (ctx *Context) WriteName(val ssa.Value) {
 	switch v := val.(type) {
 	case *ssa.Const:
-		buf.WriteByte('(')
-		writeType(buf, pkg, v.Type(), nil)
-		buf.WriteString(")(")
+		ctx.WriteByte('(')
+		ctx.WriteType(v.Type())
+		ctx.WriteString(")(")
 		if v.Value == nil {
-			buf.WriteString("nil")
+			ctx.WriteString("nil")
 		} else {
-			buf.WriteString(v.Value.String())
+			ctx.WriteString(v.Value.String())
 		}
-		buf.WriteByte(')')
+		ctx.WriteByte(')')
 	case *ssa.Parameter:
-		buf.WriteString("param_")
-		buf.WriteString(v.Name())
+		ctx.WriteString("param_")
+		ctx.WriteString(v.Name())
 	case *ssa.Field:
 		if shouldSkipAnonymous(v) {
-			writeName(buf, pkg, v.X)
+			ctx.WriteName(v.X)
 		} else {
-			buf.WriteString(v.Name())
+			ctx.WriteString(v.Name())
 		}
 	case *ssa.FieldAddr:
 		if shouldSkipAnonymous(v) {
-			writeName(buf, pkg, v.X)
+			ctx.WriteName(v.X)
 		} else {
-			buf.WriteString(v.Name())
+			ctx.WriteString(v.Name())
 		}
 	default:
-		buf.WriteString(v.Name())
+		ctx.WriteString(v.Name())
 	}
 }
 
-func writeGoto(buf *bytes.Buffer, pkg *types.Package, b *ssa.BasicBlock, i int) {
-	for _, instr := range b.Succs[i].Instrs {
+func (ctx *Context) WriteGoto(b *ssa.BasicBlock, succ int) {
+	for _, instr := range b.Succs[succ].Instrs {
 		if φ, ok := instr.(*ssa.Phi); ok {
-			writeName(buf, pkg, φ)
-			buf.WriteByte('=')
-			for j, p := range b.Succs[i].Preds {
+			ctx.WriteName(φ)
+			ctx.WriteByte('=')
+			for j, p := range b.Succs[succ].Preds {
 				if p == b {
-					writeName(buf, pkg, φ.Edges[j])
+					ctx.WriteName(φ.Edges[j])
+					if φ.Comment != "" {
+						ctx.WriteString(" // ")
+						ctx.WriteString(φ.Comment)
+					}
 					break
 				}
 			}
-			buf.WriteByte('\n')
+			ctx.WriteByte('\n')
 		} else {
 			break
 		}
 	}
-	buf.WriteString("goto b")
-	buf.WriteString(strconv.Itoa(b.Succs[i].Index))
+	ctx.WriteString("goto b")
+	ctx.WriteNumber(b.Succs[succ].Index)
 }
 
 func field(typ types.Type, f int) *types.Var {
@@ -333,43 +376,58 @@ func shouldSkipAnonymous(instr ssa.Instruction) bool {
 	return true
 }
 
-func writeCall(buf *bytes.Buffer, pkg *types.Package, c *ssa.CallCommon, i ssa.Instruction, h *FuncCallHeap) {
-	buf.WriteString("panic(\"specialize: TODO: writeCall\")")
+func (ctx *Context) WriteCall(cc ssa.CallInstruction) {
+	c := cc.Common()
+
+	if c.IsInvoke() {
+		panic("specialize: TODO: writeCall(invoke)")
+	} else {
+		switch v := c.Value.(type) {
+		case *ssa.Function:
+			panic("specialize: TODO: writeCall(function)")
+
+		case *ssa.MakeClosure:
+			panic("specialize: TODO: implement closures")
+
+		case *ssa.Builtin:
+			panic("specialize: TODO: writeCall(builtin)")
+
+		default:
+			panic("specialize: TODO: writeCall(value)")
+			_ = v
+		}
+	}
 }
 
-func Rewrite(h *FuncCallHeap, fc *FuncCall) {
-	fc.F.WriteTo(os.Stdout)
+func Rewrite(ctx *Context) {
+	ctx.Call.F.WriteTo(os.Stdout)
 
-	pkg := iprog.InitialPackages()[0].Pkg
-
-	var buf bytes.Buffer
-
-	buf.WriteString("\n\nfunc ")
-	buf.WriteString(fc.Name())
-	buf.WriteByte('(')
-	for i, p := range fc.F.Params {
+	ctx.WriteString("func ")
+	ctx.WriteString(ctx.Call.Name())
+	ctx.WriteByte('(')
+	for i, p := range ctx.Call.F.Params {
 		if i != 0 {
-			buf.WriteByte(',')
+			ctx.WriteByte(',')
 		}
-		writeName(&buf, pkg, p)
-		buf.WriteByte(' ')
-		writeType(&buf, pkg, fc.Call[i], nil)
+		ctx.WriteName(p)
+		ctx.WriteByte(' ')
+		ctx.WriteType(ctx.Call.Call[i])
 	}
-	buf.WriteByte(')')
-	if len(fc.Ret) != 0 {
-		buf.WriteString(" (")
-		for i, r := range fc.Ret {
+	ctx.WriteByte(')')
+	if len(ctx.Call.Ret) != 0 {
+		ctx.WriteString(" (")
+		for i, r := range ctx.Call.Ret {
 			if i != 0 {
-				buf.WriteByte(',')
+				ctx.WriteByte(',')
 			}
-			writeType(&buf, pkg, r, nil)
+			ctx.WriteType(r)
 		}
-		buf.WriteByte(')')
+		ctx.WriteByte(')')
 	}
-	buf.WriteString(" {\n")
+	ctx.WriteString(" {\n")
 
-	buf.WriteString("var (")
-	for _, b := range fc.F.Blocks {
+	ctx.WriteString("var (")
+	for _, b := range ctx.Call.F.Blocks {
 		for _, instr := range b.Instrs {
 			if v, ok := instr.(ssa.Value); ok && !shouldSkipAnonymous(instr) {
 				name := v.Name()
@@ -377,40 +435,40 @@ func Rewrite(h *FuncCallHeap, fc *FuncCall) {
 					if t.Len() == 0 {
 						// nothing
 					} else if t.Len() == 1 {
-						buf.WriteByte('\n')
-						buf.WriteString(name)
-						buf.WriteByte(' ')
-						writeType(&buf, pkg, t.At(0).Type(), nil)
+						ctx.WriteByte('\n')
+						ctx.WriteString(name)
+						ctx.WriteByte(' ')
+						ctx.WriteType(t.At(0).Type())
 					} else {
 						for i, l := 0, t.Len(); i < l; i++ {
-							buf.WriteByte('\n')
-							buf.WriteString(name)
-							buf.WriteByte('_')
-							buf.WriteString(strconv.Itoa(i))
-							buf.WriteByte(' ')
-							writeType(&buf, pkg, t.At(i).Type(), nil)
+							ctx.WriteByte('\n')
+							ctx.WriteString(name)
+							ctx.WriteByte('_')
+							ctx.WriteNumber(i)
+							ctx.WriteByte(' ')
+							ctx.WriteType(t.At(i).Type())
 						}
 					}
 				} else {
-					buf.WriteByte('\n')
-					buf.WriteString(name)
-					buf.WriteByte(' ')
-					writeType(&buf, pkg, v.Type(), nil)
+					ctx.WriteByte('\n')
+					ctx.WriteString(name)
+					ctx.WriteByte(' ')
+					ctx.WriteType(v.Type())
 				}
 			}
 		}
 	}
-	buf.WriteString("\n)\n")
+	ctx.WriteString("\n)\n")
 
-	for _, b := range fc.F.Blocks {
-		buf.WriteString("\nb")
-		buf.WriteString(strconv.Itoa(b.Index))
-		buf.WriteString(":")
+	for _, b := range ctx.Call.F.Blocks {
+		ctx.WriteString("\nb")
+		ctx.WriteNumber(b.Index)
+		ctx.WriteString(":")
 		if b.Comment != "" {
-			buf.WriteString(" // ")
-			buf.WriteString(b.Comment)
+			ctx.WriteString(" // ")
+			ctx.WriteString(b.Comment)
 		}
-		buf.WriteByte('\n')
+		ctx.WriteByte('\n')
 		for _, instr := range b.Instrs {
 			if _, ok := instr.(*ssa.Phi); ok {
 				// handled in writeGoto
@@ -427,172 +485,178 @@ func Rewrite(h *FuncCallHeap, fc *FuncCall) {
 					if t.Len() == 0 {
 						// nothing
 					} else if t.Len() == 1 {
-						buf.WriteString(name)
-						buf.WriteByte('=')
+						ctx.WriteString(name)
+						ctx.WriteByte('=')
 					} else {
 						for i, l := 0, t.Len(); i < l; i++ {
 							if i != 0 {
-								buf.WriteByte(',')
+								ctx.WriteByte(',')
 							}
-							buf.WriteString(name)
-							buf.WriteByte('_')
-							buf.WriteString(strconv.Itoa(i))
+							ctx.WriteString(name)
+							ctx.WriteByte('_')
+							ctx.WriteNumber(i)
 						}
-						buf.WriteByte('=')
+						ctx.WriteByte('=')
 					}
 				} else {
-					buf.WriteString(name)
-					buf.WriteByte('=')
+					ctx.WriteString(name)
+					ctx.WriteByte('=')
 				}
 			}
 
 			switch i := instr.(type) {
 			case *ssa.Alloc:
-				fmt.Fprintf(&buf, "panic(%q)", fmt.Sprintf("unhandled type: %T", i))
+				ctx.WriteString("new(")
+				ctx.WriteType(i.Type())
+				ctx.WriteByte(')')
+				if i.Comment != "" {
+					ctx.WriteString(" // ")
+					ctx.WriteString(i.Comment)
+				}
 
 			case *ssa.BinOp:
-				writeName(&buf, pkg, i.X)
-				buf.WriteString(i.Op.String())
-				writeName(&buf, pkg, i.Y)
+				ctx.WriteName(i.X)
+				ctx.WriteString(i.Op.String())
+				ctx.WriteName(i.Y)
 
 			case *ssa.Call:
-				writeCall(&buf, pkg, i.Common(), i, h)
+				ctx.WriteCall(i)
 
 			case *ssa.ChangeInterface:
-				buf.WriteByte('(')
-				writeType(&buf, pkg, i.Type(), nil)
-				buf.WriteString(")(")
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte(')')
+				ctx.WriteByte('(')
+				ctx.WriteType(i.Type())
+				ctx.WriteString(")(")
+				ctx.WriteName(i.X)
+				ctx.WriteByte(')')
 
 			case *ssa.ChangeType:
-				buf.WriteByte('(')
-				writeType(&buf, pkg, i.Type(), nil)
-				buf.WriteString(")(")
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte(')')
+				ctx.WriteByte('(')
+				ctx.WriteType(i.Type())
+				ctx.WriteString(")(")
+				ctx.WriteName(i.X)
+				ctx.WriteByte(')')
 
 			case *ssa.Convert:
-				buf.WriteByte('(')
-				writeType(&buf, pkg, i.Type(), nil)
-				buf.WriteString(")(")
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte(')')
+				ctx.WriteByte('(')
+				ctx.WriteType(i.Type())
+				ctx.WriteString(")(")
+				ctx.WriteName(i.X)
+				ctx.WriteByte(')')
 
 			case *ssa.Defer:
-				buf.WriteString("defer ")
-				writeCall(&buf, pkg, i.Common(), i, h)
+				ctx.WriteString("defer ")
+				ctx.WriteCall(i)
 
 			case *ssa.Extract:
-				buf.WriteString(i.Tuple.Name())
-				buf.WriteByte('_')
-				buf.WriteString(strconv.Itoa(i.Index))
+				ctx.WriteString(i.Tuple.Name())
+				ctx.WriteByte('_')
+				ctx.WriteNumber(i.Index)
 
 			case *ssa.Field:
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte('.')
+				ctx.WriteName(i.X)
+				ctx.WriteByte('.')
 				f := field(i.X.Type(), i.Field)
-				buf.WriteString(f.Name())
+				ctx.WriteString(f.Name())
 
 			case *ssa.FieldAddr:
-				buf.WriteByte('&')
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte('.')
+				ctx.WriteByte('&')
+				ctx.WriteName(i.X)
+				ctx.WriteByte('.')
 				f := field(i.X.Type(), i.Field)
-				buf.WriteString(f.Name())
+				ctx.WriteString(f.Name())
 
 			case *ssa.Go:
-				buf.WriteString("go ")
-				writeCall(&buf, pkg, i.Common(), i, h)
+				ctx.WriteString("go ")
+				ctx.WriteCall(i)
 
 			case *ssa.If:
-				buf.WriteString("if ")
-				writeName(&buf, pkg, i.Cond)
-				buf.WriteString(" {\n")
-				writeGoto(&buf, pkg, b, 0)
-				buf.WriteString("\n} else {\n")
-				writeGoto(&buf, pkg, b, 1)
-				buf.WriteString("\n}")
+				ctx.WriteString("if ")
+				ctx.WriteName(i.Cond)
+				ctx.WriteString(" {\n")
+				ctx.WriteGoto(b, 0)
+				ctx.WriteString("\n} else {\n")
+				ctx.WriteGoto(b, 1)
+				ctx.WriteString("\n}")
 
 			case *ssa.Index:
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte('[')
-				writeName(&buf, pkg, i.Index)
-				buf.WriteByte(']')
+				ctx.WriteName(i.X)
+				ctx.WriteByte('[')
+				ctx.WriteName(i.Index)
+				ctx.WriteByte(']')
 
 			case *ssa.IndexAddr:
-				buf.WriteByte('&')
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte('[')
-				writeName(&buf, pkg, i.Index)
-				buf.WriteByte(']')
+				ctx.WriteByte('&')
+				ctx.WriteName(i.X)
+				ctx.WriteByte('[')
+				ctx.WriteName(i.Index)
+				ctx.WriteByte(']')
 
 			case *ssa.Jump:
-				writeGoto(&buf, pkg, b, 0)
+				ctx.WriteGoto(b, 0)
 
 			case *ssa.Lookup:
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte('[')
-				writeName(&buf, pkg, i.Index)
-				buf.WriteByte(']')
+				ctx.WriteName(i.X)
+				ctx.WriteByte('[')
+				ctx.WriteName(i.Index)
+				ctx.WriteByte(']')
 
 			case *ssa.MakeChan:
-				buf.WriteString("make(")
-				writeType(&buf, pkg, i.Type(), nil)
-				buf.WriteByte(',')
-				writeName(&buf, pkg, i.Size)
-				buf.WriteByte(')')
+				ctx.WriteString("make(")
+				ctx.WriteType(i.Type())
+				ctx.WriteByte(',')
+				ctx.WriteName(i.Size)
+				ctx.WriteByte(')')
 
 			case *ssa.MakeClosure:
 				panic("specialize: TODO: implement closures")
 
 			case *ssa.MakeInterface:
-				buf.WriteByte('(')
-				writeType(&buf, pkg, i.Type(), nil)
-				buf.WriteString(")(")
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte(')')
+				ctx.WriteByte('(')
+				ctx.WriteType(i.Type())
+				ctx.WriteString(")(")
+				ctx.WriteName(i.X)
+				ctx.WriteByte(')')
 
 			case *ssa.MakeMap:
-				buf.WriteString("make(")
-				writeType(&buf, pkg, i.Type(), nil)
+				ctx.WriteString("make(")
+				ctx.WriteType(i.Type())
 				if i.Reserve != nil {
-					buf.WriteByte(',')
-					writeName(&buf, pkg, i.Reserve)
+					ctx.WriteByte(',')
+					ctx.WriteName(i.Reserve)
 				}
-				buf.WriteByte(')')
+				ctx.WriteByte(')')
 
 			case *ssa.MakeSlice:
-				buf.WriteString("make(")
-				writeType(&buf, pkg, i.Type(), nil)
-				buf.WriteByte(',')
-				writeName(&buf, pkg, i.Len)
-				buf.WriteByte(',')
-				writeName(&buf, pkg, i.Cap)
-				buf.WriteByte(')')
+				ctx.WriteString("make(")
+				ctx.WriteType(i.Type())
+				ctx.WriteByte(',')
+				ctx.WriteName(i.Len)
+				ctx.WriteByte(',')
+				ctx.WriteName(i.Cap)
+				ctx.WriteByte(')')
 
 			case *ssa.MapUpdate:
-				writeName(&buf, pkg, i.Map)
-				buf.WriteByte('[')
-				writeName(&buf, pkg, i.Key)
-				buf.WriteString("]=")
-				writeName(&buf, pkg, i.Value)
+				ctx.WriteName(i.Map)
+				ctx.WriteByte('[')
+				ctx.WriteName(i.Key)
+				ctx.WriteString("]=")
+				ctx.WriteName(i.Value)
 
 			case *ssa.Next:
 				panic("specialize: TODO: implement map/string iterators")
 
 			case *ssa.Panic:
-				buf.WriteString("panic(")
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte(')')
+				ctx.WriteString("panic(")
+				ctx.WriteName(i.X)
+				ctx.WriteByte(')')
 
 			case *ssa.Return:
-				buf.WriteString("return ")
+				ctx.WriteString("return ")
 				for i, r := range i.Results {
 					if i != 0 {
-						buf.WriteByte(',')
+						ctx.WriteByte(',')
 					}
-					writeName(&buf, pkg, r)
+					ctx.WriteName(r)
 				}
 
 			case *ssa.RunDefers:
@@ -602,59 +666,48 @@ func Rewrite(h *FuncCallHeap, fc *FuncCall) {
 				panic("specialize: TODO: implement select")
 
 			case *ssa.Send:
-				writeName(&buf, pkg, i.Chan)
-				buf.WriteString("<-")
-				writeName(&buf, pkg, i.X)
+				ctx.WriteName(i.Chan)
+				ctx.WriteString("<-")
+				ctx.WriteName(i.X)
 
 			case *ssa.Slice:
-				writeName(&buf, pkg, i.X)
-				buf.WriteByte('[')
+				ctx.WriteName(i.X)
+				ctx.WriteByte('[')
 				if i.Low != nil {
-					writeName(&buf, pkg, i.Low)
+					ctx.WriteName(i.Low)
 				}
-				buf.WriteByte(':')
+				ctx.WriteByte(':')
 				if i.High != nil {
-					writeName(&buf, pkg, i.High)
+					ctx.WriteName(i.High)
 				}
 				if i.Max != nil {
-					buf.WriteByte(':')
-					writeName(&buf, pkg, i.Max)
+					ctx.WriteByte(':')
+					ctx.WriteName(i.Max)
 				}
-				buf.WriteByte(']')
+				ctx.WriteByte(']')
 
 			case *ssa.Store:
-				buf.WriteByte('*')
-				writeName(&buf, pkg, i.Addr)
-				buf.WriteByte('=')
-				writeName(&buf, pkg, i.Val)
+				ctx.WriteByte('*')
+				ctx.WriteName(i.Addr)
+				ctx.WriteByte('=')
+				ctx.WriteName(i.Val)
 
 			case *ssa.TypeAssert:
-				writeName(&buf, pkg, i.X)
-				buf.WriteString(".(")
-				writeType(&buf, pkg, i.AssertedType, nil)
-				buf.WriteByte(')')
+				ctx.WriteName(i.X)
+				ctx.WriteString(".(")
+				ctx.WriteType(i.AssertedType)
+				ctx.WriteByte(')')
 
 			case *ssa.UnOp:
-				buf.WriteString(i.Op.String())
-				writeName(&buf, pkg, i.X)
+				ctx.WriteString(i.Op.String())
+				ctx.WriteName(i.X)
 
 			default:
 				panic("unreachable")
 			}
-			buf.WriteByte('\n')
+			ctx.WriteByte('\n')
 		}
 	}
 
-	buf.WriteByte('}')
-
-	b, err := format.Source(buf.Bytes())
-	if err != nil {
-		panic(err)
-	}
-	_, err = os.Stdout.Write(b)
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println()
+	ctx.WriteString("\n")
 }

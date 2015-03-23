@@ -162,7 +162,9 @@ func (ctx *Context) writeType(typ types.Type, visited []types.Type) {
 		s := "<Named w/o object>"
 		if obj := t.Obj(); obj != nil {
 			if pkg := obj.Pkg(); pkg != nil && pkg != ctx.Pkg {
-				//ctx.WriteString(pkg.Path()) // XXX(BenLubar): commented this line
+				if ctx.Imports != nil {
+					ctx.Imports[pkg.Path()] = true
+				}
 				ctx.WriteString(pkg.Name())
 				ctx.WriteByte('.')
 			}

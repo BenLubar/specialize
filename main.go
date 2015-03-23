@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"container/heap"
-	"fmt"
 	"go/format"
 	"log"
 	"os"
@@ -21,10 +20,13 @@ import (
 var iprog *loader.Program
 
 type Context struct {
-	Pkg  *types.Package
-	RTA  *rta.Result
-	Heap FuncCallHeap
-	Call *FuncCall
+	SSA     *ssa.Program
+	Pkg     *types.Package
+	RTA     *rta.Result
+	Heap    FuncCallHeap
+	Call    *FuncCall
+	Type    map[ssa.Value]types.Type
+	Imports map[string]bool
 	bytes.Buffer
 }
 
@@ -57,18 +59,16 @@ func main() {
 		}
 
 		var ctx Context
+		ctx.SSA = prog
 		ctx.RTA = rta.Analyze(functions, true)
 		ctx.Pkg = ipkg.Pkg
+		ctx.Imports = make(map[string]bool)
 		fcctx.Pkg = ipkg.Pkg
 		for _, f := range functions {
 			ctx.Analyze(f)
 		}
 
 		ctx.Heap.Init()
-
-		ctx.WriteString("package ")
-		ctx.WriteString(ctx.Pkg.Name())
-		ctx.WriteByte('\n')
 
 		seen := make(map[string]bool)
 		for ctx.Heap.Len() != 0 {
@@ -83,7 +83,16 @@ func main() {
 			Rewrite(&ctx)
 		}
 
-		b, err := format.Source(ctx.Bytes())
+		b := []byte("package ")
+		b = append(b, ctx.Pkg.Name()...)
+		for path := range ctx.Imports {
+			b = append(b, "\nimport "...)
+			b = strconv.AppendQuote(b, path)
+		}
+		b = append(b, '\n')
+		b = append(b, ctx.Bytes()...)
+
+		b, err = format.Source(b)
 		if err != nil {
 			panic(err)
 		}
@@ -91,8 +100,6 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-
-		fmt.Println()
 	}
 }
 
@@ -223,7 +230,7 @@ func (ctx *Context) Analyze(f *ssa.Function) {
 				if usesReflection(ctx.RTA.CallGraph.Nodes[cf], make(map[int]bool)) {
 					continue
 				}
-				if call := usesInterface(cc, cf); call != nil {
+				if call := ctx.shouldRewrite(cc, cf); call != nil {
 					ctx.Heap = append(ctx.Heap, call)
 				}
 			}
@@ -231,28 +238,51 @@ func (ctx *Context) Analyze(f *ssa.Function) {
 	}
 }
 
-func usesInterface(cc ssa.CallInstruction, cf *ssa.Function) *FuncCall {
+func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function) *FuncCall {
+	for _, b := range cf.Blocks {
+		for _, instr := range b.Instrs {
+			var f *types.Var
+			switch i := instr.(type) {
+			case *ssa.Field:
+				f = field(ctx.TypeOf(i.X), i.Field)
+			case *ssa.FieldAddr:
+				f = field(ctx.TypeOf(i.X), i.Field)
+			}
+
+			if f != nil && f.Pkg() != ctx.Pkg && !f.Exported() {
+				return nil // we can't do anything if there's an unexported field access.
+			}
+
+			// TODO(BenLubar): also handle unexported globals
+		}
+	}
+
 	c := cc.Common()
 
 	anyInterface := false
 	ret := c.Signature().Results()
 
 	call := &FuncCall{
-		F:    cf,
-		Call: make([]types.Type, len(c.Args)),
+		F: cf,
 	}
-	for i, v := range c.Args {
-		call.Call[i] = v.Type()
+	if c.IsInvoke() {
+		call.Call = append(call.Call, ctx.TypeOf(c.Value))
+	}
+	for _, v := range c.Args {
+		t := ctx.TypeOf(v)
 		if m, ok := v.(*ssa.MakeInterface); ok {
+			t = ctx.TypeOf(m.X)
 			anyInterface = true
-			call.Call[i] = m.X.Type()
+		} else if v.Type() != t {
+			anyInterface = true
 		}
+		call.Call = append(call.Call, t)
 	}
 	if v, ok := cc.(ssa.Value); ok && ret.Len() > 0 {
 		ref := *v.Referrers()
 		if len(ref) > 0 {
 			if a, ok := ref[0].(*ssa.TypeAssert); ok && len(ref) == 1 && !a.CommaOk {
-				call.Ret = []types.Type{a.Type()}
+				call.Ret = []types.Type{ctx.TypeOf(a)}
 			} else {
 				for i, l := 0, ret.Len(); i < l; i++ {
 					call.Ret = append(call.Ret, ret.At(i).Type())
@@ -275,7 +305,7 @@ func (ctx *Context) WriteName(val ssa.Value) {
 	switch v := val.(type) {
 	case *ssa.Const:
 		ctx.WriteByte('(')
-		ctx.WriteType(v.Type())
+		ctx.WriteTypeOf(v)
 		ctx.WriteString(")(")
 		if v.Value == nil {
 			ctx.WriteString("nil")
@@ -341,66 +371,96 @@ func field(typ types.Type, f int) *types.Var {
 }
 
 func shouldSkipAnonymous(instr ssa.Instruction) bool {
-	var x ssa.Value
-	var f *types.Var
-
-	switch i := instr.(type) {
-	case *ssa.Field:
-		x = i.X
-		f = field(x.Type(), i.Field)
-	case *ssa.FieldAddr:
-		x = i.X
-		f = field(x.Type(), i.Field)
-	default:
-		return false
-	}
-
-	if !f.Anonymous() {
-		return false
-	}
-
-	for _, ref := range *instr.(ssa.Value).Referrers() {
-		switch i := ref.(type) {
-		case ssa.CallInstruction:
-			c := i.Common()
-			if c.Args[0] != instr.(ssa.Value) {
-				return false
-			}
-		case *ssa.Field, *ssa.FieldAddr:
-			// a.b.c is the same as a.c if b is anonymous.
-		default:
-			return false
-		}
-	}
-
-	return true
+	return false
 }
 
 func (ctx *Context) WriteCall(cc ssa.CallInstruction) {
 	c := cc.Common()
 
+	concrete := func(v *ssa.Function) {
+		if call := ctx.shouldRewrite(cc, v); call != nil {
+			ctx.Heap.Add(call)
+			ctx.WriteString(call.Name())
+			return
+		}
+
+		if v.Parent() != nil {
+			panic("specialize: TODO: writeCall(inline)")
+		} else if recv := v.Signature.Recv(); recv != nil {
+			ctx.WriteByte('(')
+			ctx.WriteType(recv.Type())
+			ctx.WriteString(").")
+		} else if pkg := v.Package().Object; pkg != ctx.Pkg {
+			ctx.Imports[pkg.Path()] = true
+			ctx.WriteString(pkg.Name())
+			ctx.WriteByte('.')
+		}
+
+		ctx.WriteString(v.Name())
+	}
+
 	if c.IsInvoke() {
-		panic("specialize: TODO: writeCall(invoke)")
+		v := ctx.SSA.LookupMethod(ctx.TypeOf(c.Value), ctx.Pkg, c.Method.Name())
+		if v != nil {
+			concrete(v)
+		} else {
+			ctx.WriteName(c.Value)
+			ctx.WriteByte('.')
+			ctx.WriteString(c.Method.Name())
+		}
 	} else {
 		switch v := c.Value.(type) {
 		case *ssa.Function:
-			panic("specialize: TODO: writeCall(function)")
+			concrete(v)
 
 		case *ssa.MakeClosure:
 			panic("specialize: TODO: implement closures")
 
 		case *ssa.Builtin:
-			panic("specialize: TODO: writeCall(builtin)")
+			ctx.WriteString(v.Name())
 
 		default:
 			panic("specialize: TODO: writeCall(value)")
-			_ = v
 		}
 	}
+	ctx.WriteByte('(')
+	if c.IsInvoke() {
+		ctx.WriteName(c.Value)
+	}
+	for i, p := range c.Args {
+		if i != 0 || c.IsInvoke() {
+			ctx.WriteByte(',')
+		}
+		ctx.WriteName(p)
+	}
+	ctx.WriteByte(')')
+}
+
+func (ctx *Context) TypeOf(v ssa.Value) types.Type {
+	if t, ok := ctx.Type[v]; ok {
+		return t
+	}
+	return v.Type()
+}
+
+func (ctx *Context) WriteTypeOf(v ssa.Value) {
+	ctx.WriteType(ctx.TypeOf(v))
 }
 
 func Rewrite(ctx *Context) {
-	ctx.Call.F.WriteTo(os.Stdout)
+	ctx.Type = make(map[ssa.Value]types.Type)
+
+	for i, p := range ctx.Call.F.Params {
+		ctx.Type[p] = ctx.Call.Call[i]
+	}
+
+	for {
+		changed := false
+
+		if !changed {
+			break
+		}
+	}
 
 	ctx.WriteString("func ")
 	ctx.WriteString(ctx.Call.Name())
@@ -411,7 +471,7 @@ func Rewrite(ctx *Context) {
 		}
 		ctx.WriteName(p)
 		ctx.WriteByte(' ')
-		ctx.WriteType(ctx.Call.Call[i])
+		ctx.WriteTypeOf(p)
 	}
 	ctx.WriteByte(')')
 	if len(ctx.Call.Ret) != 0 {
@@ -431,7 +491,7 @@ func Rewrite(ctx *Context) {
 		for _, instr := range b.Instrs {
 			if v, ok := instr.(ssa.Value); ok && !shouldSkipAnonymous(instr) {
 				name := v.Name()
-				if t, ok := v.Type().(*types.Tuple); ok {
+				if t, ok := ctx.TypeOf(v).(*types.Tuple); ok {
 					if t.Len() == 0 {
 						// nothing
 					} else if t.Len() == 1 {
@@ -453,7 +513,7 @@ func Rewrite(ctx *Context) {
 					ctx.WriteByte('\n')
 					ctx.WriteString(name)
 					ctx.WriteByte(' ')
-					ctx.WriteType(v.Type())
+					ctx.WriteTypeOf(v)
 				}
 			}
 		}
@@ -481,7 +541,7 @@ func Rewrite(ctx *Context) {
 
 			if v, ok := instr.(ssa.Value); ok {
 				name := v.Name()
-				if t, ok := v.Type().(*types.Tuple); ok {
+				if t, ok := ctx.TypeOf(v).(*types.Tuple); ok {
 					if t.Len() == 0 {
 						// nothing
 					} else if t.Len() == 1 {
@@ -507,7 +567,7 @@ func Rewrite(ctx *Context) {
 			switch i := instr.(type) {
 			case *ssa.Alloc:
 				ctx.WriteString("new(")
-				ctx.WriteType(i.Type())
+				ctx.WriteType(ctx.TypeOf(i).(*types.Pointer).Elem())
 				ctx.WriteByte(')')
 				if i.Comment != "" {
 					ctx.WriteString(" // ")
@@ -524,21 +584,21 @@ func Rewrite(ctx *Context) {
 
 			case *ssa.ChangeInterface:
 				ctx.WriteByte('(')
-				ctx.WriteType(i.Type())
+				ctx.WriteTypeOf(i)
 				ctx.WriteString(")(")
 				ctx.WriteName(i.X)
 				ctx.WriteByte(')')
 
 			case *ssa.ChangeType:
 				ctx.WriteByte('(')
-				ctx.WriteType(i.Type())
+				ctx.WriteTypeOf(i)
 				ctx.WriteString(")(")
 				ctx.WriteName(i.X)
 				ctx.WriteByte(')')
 
 			case *ssa.Convert:
 				ctx.WriteByte('(')
-				ctx.WriteType(i.Type())
+				ctx.WriteTypeOf(i)
 				ctx.WriteString(")(")
 				ctx.WriteName(i.X)
 				ctx.WriteByte(')')
@@ -555,14 +615,14 @@ func Rewrite(ctx *Context) {
 			case *ssa.Field:
 				ctx.WriteName(i.X)
 				ctx.WriteByte('.')
-				f := field(i.X.Type(), i.Field)
+				f := field(ctx.TypeOf(i.X), i.Field)
 				ctx.WriteString(f.Name())
 
 			case *ssa.FieldAddr:
 				ctx.WriteByte('&')
 				ctx.WriteName(i.X)
 				ctx.WriteByte('.')
-				f := field(i.X.Type(), i.Field)
+				f := field(ctx.TypeOf(i.X), i.Field)
 				ctx.WriteString(f.Name())
 
 			case *ssa.Go:
@@ -602,7 +662,7 @@ func Rewrite(ctx *Context) {
 
 			case *ssa.MakeChan:
 				ctx.WriteString("make(")
-				ctx.WriteType(i.Type())
+				ctx.WriteTypeOf(i)
 				ctx.WriteByte(',')
 				ctx.WriteName(i.Size)
 				ctx.WriteByte(')')
@@ -612,14 +672,14 @@ func Rewrite(ctx *Context) {
 
 			case *ssa.MakeInterface:
 				ctx.WriteByte('(')
-				ctx.WriteType(i.Type())
+				ctx.WriteTypeOf(i)
 				ctx.WriteString(")(")
 				ctx.WriteName(i.X)
 				ctx.WriteByte(')')
 
 			case *ssa.MakeMap:
 				ctx.WriteString("make(")
-				ctx.WriteType(i.Type())
+				ctx.WriteTypeOf(i)
 				if i.Reserve != nil {
 					ctx.WriteByte(',')
 					ctx.WriteName(i.Reserve)
@@ -628,7 +688,7 @@ func Rewrite(ctx *Context) {
 
 			case *ssa.MakeSlice:
 				ctx.WriteString("make(")
-				ctx.WriteType(i.Type())
+				ctx.WriteTypeOf(i)
 				ctx.WriteByte(',')
 				ctx.WriteName(i.Len)
 				ctx.WriteByte(',')
@@ -709,5 +769,5 @@ func Rewrite(ctx *Context) {
 		}
 	}
 
-	ctx.WriteString("\n")
+	ctx.WriteString("}\n\n")
 }

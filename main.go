@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"container/heap"
 	"fmt"
-	"go/ast"
+	"go/format"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -188,9 +189,7 @@ func UsesReflection(n *callgraph.Node, seen map[int]bool) bool {
 func Analyze(f *ssa.Function, result *rta.Result, h FuncCallHeap) FuncCallHeap {
 	for _, b := range f.Blocks {
 		for _, instr := range b.Instrs {
-			if cc, ok := instr.(interface {
-				Common() *ssa.CallCommon
-			}); ok {
+			if cc, ok := instr.(ssa.CallInstruction); ok {
 				c := cc.Common()
 				cf := c.StaticCallee()
 				if cf == nil {
@@ -233,38 +232,429 @@ func Analyze(f *ssa.Function, result *rta.Result, h FuncCallHeap) FuncCallHeap {
 	return h
 }
 
+func writeName(buf *bytes.Buffer, pkg *types.Package, val ssa.Value) {
+	switch v := val.(type) {
+	case *ssa.Const:
+		buf.WriteByte('(')
+		writeType(buf, pkg, v.Type(), nil)
+		buf.WriteString(")(")
+		if v.Value == nil {
+			buf.WriteString("nil")
+		} else {
+			buf.WriteString(v.Value.String())
+		}
+		buf.WriteByte(')')
+	case *ssa.Parameter:
+		buf.WriteString("param_")
+		buf.WriteString(v.Name())
+	case *ssa.Field:
+		if shouldSkipAnonymous(v) {
+			writeName(buf, pkg, v.X)
+		} else {
+			buf.WriteString(v.Name())
+		}
+	case *ssa.FieldAddr:
+		if shouldSkipAnonymous(v) {
+			writeName(buf, pkg, v.X)
+		} else {
+			buf.WriteString(v.Name())
+		}
+	default:
+		buf.WriteString(v.Name())
+	}
+}
+
+func writeGoto(buf *bytes.Buffer, pkg *types.Package, b *ssa.BasicBlock, i int) {
+	for _, instr := range b.Succs[i].Instrs {
+		if φ, ok := instr.(*ssa.Phi); ok {
+			writeName(buf, pkg, φ)
+			buf.WriteByte('=')
+			for j, p := range b.Succs[i].Preds {
+				if p == b {
+					writeName(buf, pkg, φ.Edges[j])
+					break
+				}
+			}
+			buf.WriteByte('\n')
+		} else {
+			break
+		}
+	}
+	buf.WriteString("goto b")
+	buf.WriteString(strconv.Itoa(b.Succs[i].Index))
+}
+
+func field(typ types.Type, f int) *types.Var {
+	switch t := typ.(type) {
+	case *types.Named:
+		return field(t.Underlying(), f)
+	case *types.Pointer:
+		return field(t.Elem(), f)
+	case *types.Struct:
+		return t.Field(f)
+	default:
+		panic("unreachable")
+	}
+}
+
+func shouldSkipAnonymous(instr ssa.Instruction) bool {
+	var x ssa.Value
+	var f *types.Var
+
+	switch i := instr.(type) {
+	case *ssa.Field:
+		x = i.X
+		f = field(x.Type(), i.Field)
+	case *ssa.FieldAddr:
+		x = i.X
+		f = field(x.Type(), i.Field)
+	default:
+		return false
+	}
+
+	if !f.Anonymous() {
+		return false
+	}
+
+	for _, ref := range *instr.(ssa.Value).Referrers() {
+		switch i := ref.(type) {
+		case ssa.CallInstruction:
+			c := i.Common()
+			if c.Args[0] != instr.(ssa.Value) {
+				return false
+			}
+		case *ssa.Field, *ssa.FieldAddr:
+			// a.b.c is the same as a.c if b is anonymous.
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
+func writeCall(buf *bytes.Buffer, pkg *types.Package, c *ssa.CallCommon, i ssa.Instruction, h *FuncCallHeap) {
+	buf.WriteString("panic(\"specialize: TODO: writeCall\")")
+}
+
 func Rewrite(h *FuncCallHeap, fc *FuncCall) {
 	fc.F.WriteTo(os.Stdout)
 
-	//ast.Print(iprog.Fset, f)
-	//printer.Fprint(os.Stdout, iprog.Fset, f)
-	fmt.Println()
-}
+	pkg := iprog.InitialPackages()[0].Pkg
 
-func TypeExpr(pi *loader.PackageInfo, typ types.Type) ast.Expr {
-	switch t := typ.(type) {
-	case *types.Pointer:
-		return &ast.StarExpr{
-			X: TypeExpr(pi, t.Elem()),
+	var buf bytes.Buffer
+
+	buf.WriteString("\n\nfunc ")
+	buf.WriteString(fc.Name())
+	buf.WriteByte('(')
+	for i, p := range fc.F.Params {
+		if i != 0 {
+			buf.WriteByte(',')
 		}
-	case *types.Named:
-		if t.Obj().Pkg() == pi.Pkg {
-			return ast.NewIdent(t.Obj().Name())
-		}
-		if !t.Obj().Exported() {
-			panic(fmt.Errorf("specialize: %v is not exported", t))
-		}
-		return &ast.SelectorExpr{
-			X:   ast.NewIdent(t.Obj().Pkg().Name()),
-			Sel: ast.NewIdent(t.Obj().Name()),
-		}
-	case *types.Basic:
-		return ast.NewIdent(t.Name())
-	case *types.Slice:
-		return &ast.ArrayType{
-			Elt: TypeExpr(pi, t.Elem()),
-		}
-	default:
-		panic(fmt.Errorf("specialize: unhandled type: %T", t))
+		writeName(&buf, pkg, p)
+		buf.WriteByte(' ')
+		writeType(&buf, pkg, fc.Call[i], nil)
 	}
+	buf.WriteByte(')')
+	if len(fc.Ret) != 0 {
+		buf.WriteString(" (")
+		for i, r := range fc.Ret {
+			if i != 0 {
+				buf.WriteByte(',')
+			}
+			writeType(&buf, pkg, r, nil)
+		}
+		buf.WriteByte(')')
+	}
+	buf.WriteString(" {\n")
+
+	buf.WriteString("var (")
+	for _, b := range fc.F.Blocks {
+		for _, instr := range b.Instrs {
+			if v, ok := instr.(ssa.Value); ok && !shouldSkipAnonymous(instr) {
+				name := v.Name()
+				if t, ok := v.Type().(*types.Tuple); ok {
+					if t.Len() == 0 {
+						// nothing
+					} else if t.Len() == 1 {
+						buf.WriteByte('\n')
+						buf.WriteString(name)
+						buf.WriteByte(' ')
+						writeType(&buf, pkg, t.At(0).Type(), nil)
+					} else {
+						for i, l := 0, t.Len(); i < l; i++ {
+							buf.WriteByte('\n')
+							buf.WriteString(name)
+							buf.WriteByte('_')
+							buf.WriteString(strconv.Itoa(i))
+							buf.WriteByte(' ')
+							writeType(&buf, pkg, t.At(i).Type(), nil)
+						}
+					}
+				} else {
+					buf.WriteByte('\n')
+					buf.WriteString(name)
+					buf.WriteByte(' ')
+					writeType(&buf, pkg, v.Type(), nil)
+				}
+			}
+		}
+	}
+	buf.WriteString("\n)\n")
+
+	for _, b := range fc.F.Blocks {
+		buf.WriteString("\nb")
+		buf.WriteString(strconv.Itoa(b.Index))
+		buf.WriteString(":")
+		if b.Comment != "" {
+			buf.WriteString(" // ")
+			buf.WriteString(b.Comment)
+		}
+		buf.WriteByte('\n')
+		for _, instr := range b.Instrs {
+			if _, ok := instr.(*ssa.Phi); ok {
+				// handled in writeGoto
+				continue
+			}
+
+			if shouldSkipAnonymous(instr) {
+				continue
+			}
+
+			if v, ok := instr.(ssa.Value); ok {
+				name := v.Name()
+				if t, ok := v.Type().(*types.Tuple); ok {
+					if t.Len() == 0 {
+						// nothing
+					} else if t.Len() == 1 {
+						buf.WriteString(name)
+						buf.WriteByte('=')
+					} else {
+						for i, l := 0, t.Len(); i < l; i++ {
+							if i != 0 {
+								buf.WriteByte(',')
+							}
+							buf.WriteString(name)
+							buf.WriteByte('_')
+							buf.WriteString(strconv.Itoa(i))
+						}
+						buf.WriteByte('=')
+					}
+				} else {
+					buf.WriteString(name)
+					buf.WriteByte('=')
+				}
+			}
+
+			switch i := instr.(type) {
+			case *ssa.Alloc:
+				fmt.Fprintf(&buf, "panic(%q)", fmt.Sprintf("unhandled type: %T", i))
+
+			case *ssa.BinOp:
+				writeName(&buf, pkg, i.X)
+				buf.WriteString(i.Op.String())
+				writeName(&buf, pkg, i.Y)
+
+			case *ssa.Call:
+				writeCall(&buf, pkg, i.Common(), i, h)
+
+			case *ssa.ChangeInterface:
+				buf.WriteByte('(')
+				writeType(&buf, pkg, i.Type(), nil)
+				buf.WriteString(")(")
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte(')')
+
+			case *ssa.ChangeType:
+				buf.WriteByte('(')
+				writeType(&buf, pkg, i.Type(), nil)
+				buf.WriteString(")(")
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte(')')
+
+			case *ssa.Convert:
+				buf.WriteByte('(')
+				writeType(&buf, pkg, i.Type(), nil)
+				buf.WriteString(")(")
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte(')')
+
+			case *ssa.Defer:
+				buf.WriteString("defer ")
+				writeCall(&buf, pkg, i.Common(), i, h)
+
+			case *ssa.Extract:
+				buf.WriteString(i.Tuple.Name())
+				buf.WriteByte('_')
+				buf.WriteString(strconv.Itoa(i.Index))
+
+			case *ssa.Field:
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte('.')
+				f := field(i.X.Type(), i.Field)
+				buf.WriteString(f.Name())
+
+			case *ssa.FieldAddr:
+				buf.WriteByte('&')
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte('.')
+				f := field(i.X.Type(), i.Field)
+				buf.WriteString(f.Name())
+
+			case *ssa.Go:
+				buf.WriteString("go ")
+				writeCall(&buf, pkg, i.Common(), i, h)
+
+			case *ssa.If:
+				buf.WriteString("if ")
+				writeName(&buf, pkg, i.Cond)
+				buf.WriteString(" {\n")
+				writeGoto(&buf, pkg, b, 0)
+				buf.WriteString("\n} else {\n")
+				writeGoto(&buf, pkg, b, 1)
+				buf.WriteString("\n}")
+
+			case *ssa.Index:
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte('[')
+				writeName(&buf, pkg, i.Index)
+				buf.WriteByte(']')
+
+			case *ssa.IndexAddr:
+				buf.WriteByte('&')
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte('[')
+				writeName(&buf, pkg, i.Index)
+				buf.WriteByte(']')
+
+			case *ssa.Jump:
+				writeGoto(&buf, pkg, b, 0)
+
+			case *ssa.Lookup:
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte('[')
+				writeName(&buf, pkg, i.Index)
+				buf.WriteByte(']')
+
+			case *ssa.MakeChan:
+				buf.WriteString("make(")
+				writeType(&buf, pkg, i.Type(), nil)
+				buf.WriteByte(',')
+				writeName(&buf, pkg, i.Size)
+				buf.WriteByte(')')
+
+			case *ssa.MakeClosure:
+				panic("specialize: TODO: implement closures")
+
+			case *ssa.MakeInterface:
+				buf.WriteByte('(')
+				writeType(&buf, pkg, i.Type(), nil)
+				buf.WriteString(")(")
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte(')')
+
+			case *ssa.MakeMap:
+				buf.WriteString("make(")
+				writeType(&buf, pkg, i.Type(), nil)
+				if i.Reserve != nil {
+					buf.WriteByte(',')
+					writeName(&buf, pkg, i.Reserve)
+				}
+				buf.WriteByte(')')
+
+			case *ssa.MakeSlice:
+				buf.WriteString("make(")
+				writeType(&buf, pkg, i.Type(), nil)
+				buf.WriteByte(',')
+				writeName(&buf, pkg, i.Len)
+				buf.WriteByte(',')
+				writeName(&buf, pkg, i.Cap)
+				buf.WriteByte(')')
+
+			case *ssa.MapUpdate:
+				writeName(&buf, pkg, i.Map)
+				buf.WriteByte('[')
+				writeName(&buf, pkg, i.Key)
+				buf.WriteString("]=")
+				writeName(&buf, pkg, i.Value)
+
+			case *ssa.Next:
+				panic("specialize: TODO: implement map/string iterators")
+
+			case *ssa.Panic:
+				buf.WriteString("panic(")
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte(')')
+
+			case *ssa.Return:
+				buf.WriteString("return ")
+				for i, r := range i.Results {
+					if i != 0 {
+						buf.WriteByte(',')
+					}
+					writeName(&buf, pkg, r)
+				}
+
+			case *ssa.RunDefers:
+				panic("specialize: TODO: implement RunDefers")
+
+			case *ssa.Select:
+				panic("specialize: TODO: implement select")
+
+			case *ssa.Send:
+				writeName(&buf, pkg, i.Chan)
+				buf.WriteString("<-")
+				writeName(&buf, pkg, i.X)
+
+			case *ssa.Slice:
+				writeName(&buf, pkg, i.X)
+				buf.WriteByte('[')
+				if i.Low != nil {
+					writeName(&buf, pkg, i.Low)
+				}
+				buf.WriteByte(':')
+				if i.High != nil {
+					writeName(&buf, pkg, i.High)
+				}
+				if i.Max != nil {
+					buf.WriteByte(':')
+					writeName(&buf, pkg, i.Max)
+				}
+				buf.WriteByte(']')
+
+			case *ssa.Store:
+				buf.WriteByte('*')
+				writeName(&buf, pkg, i.Addr)
+				buf.WriteByte('=')
+				writeName(&buf, pkg, i.Val)
+
+			case *ssa.TypeAssert:
+				writeName(&buf, pkg, i.X)
+				buf.WriteString(".(")
+				writeType(&buf, pkg, i.AssertedType, nil)
+				buf.WriteByte(')')
+
+			case *ssa.UnOp:
+				buf.WriteString(i.Op.String())
+				writeName(&buf, pkg, i.X)
+
+			default:
+				panic("unreachable")
+			}
+			buf.WriteByte('\n')
+		}
+	}
+
+	buf.WriteByte('}')
+
+	b, err := format.Source(buf.Bytes())
+	if err != nil {
+		panic(err)
+	}
+	_, err = os.Stdout.Write(b)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println()
 }

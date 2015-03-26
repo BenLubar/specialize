@@ -2,6 +2,8 @@
 
 package main
 
+import "container/heap"
+
 type IntSlice []int
 
 func (s IntSlice) Len() int            { return len(s) }
@@ -13,3 +15,7 @@ func (s *IntSlice) Pop() (v interface{}) {
 	*s, v = (*s)[:n], (*s)[n]
 	return
 }
+
+func (s *IntSlice) Init()       { heap.Init(s) }
+func (s *IntSlice) Add(i int)   { heap.Push(s, i) }
+func (s *IntSlice) Remove() int { return heap.Pop(s).(int) }

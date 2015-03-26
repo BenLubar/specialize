@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"container/heap"
+	"go/build"
 	"go/format"
+	"go/token"
+	"io/ioutil"
 	"log"
-	"os"
+	"sort"
 	"strconv"
-	"strings"
 	"unicode"
 
 	"golang.org/x/tools/go/callgraph"
@@ -35,6 +37,9 @@ func main() {
 	log.SetPrefix("specialize: ")
 
 	var conf loader.Config
+	bctx := build.Default
+	bctx.BuildTags = append(bctx.BuildTags, "no_specialized")
+	conf.Build = &bctx
 
 	conf.ImportWithTests(".")
 
@@ -47,7 +52,10 @@ func main() {
 	prog := ssa.Create(iprog, ssa.SanityCheckFunctions)
 	prog.BuildAll()
 
-	for _, ipkg := range iprog.InitialPackages() {
+	packages := PackageInfoSlice(iprog.InitialPackages())
+	packages.Sort()
+
+	for i, ipkg := range packages {
 		pkg := prog.Package(ipkg.Pkg)
 
 		var functions []*ssa.Function
@@ -55,6 +63,12 @@ func main() {
 		for _, m := range pkg.Members {
 			if f, ok := m.(*ssa.Function); ok {
 				functions = append(functions, f)
+			}
+			if t, ok := m.(*ssa.Type); ok {
+				ms := prog.MethodSets.MethodSet(t.Type())
+				for i, l := 0, ms.Len(); i < l; i++ {
+					functions = append(functions, prog.Method(ms.At(i)))
+				}
 			}
 		}
 
@@ -64,10 +78,12 @@ func main() {
 		ctx.Pkg = ipkg.Pkg
 		ctx.Imports = make(map[string]bool)
 		fcctx.Pkg = ipkg.Pkg
-		for _, f := range functions {
-			ctx.Analyze(f)
-		}
 
+		for _, f := range functions {
+			if call := ctx.shouldRewrite(nil, f, make(map[ssa.CallInstruction]bool)); call != nil {
+				ctx.Heap = append(ctx.Heap, call)
+			}
+		}
 		ctx.Heap.Init()
 
 		seen := make(map[string]bool)
@@ -79,11 +95,11 @@ func main() {
 			}
 			seen[ctx.Call.Name()] = true
 
-			log.Println(ctx.Call.Name())
+			//log.Println(ctx.Call.Name())
 			Rewrite(&ctx)
 		}
 
-		b := []byte("package ")
+		b := []byte("//+build !no_specialized\n\npackage ")
 		b = append(b, ctx.Pkg.Name()...)
 		for path := range ctx.Imports {
 			b = append(b, "\nimport "...)
@@ -92,24 +108,41 @@ func main() {
 		b = append(b, '\n')
 		b = append(b, ctx.Bytes()...)
 
+		orig := b
 		b, err = format.Source(b)
 		if err != nil {
-			panic(err)
+			log.Println("error formatting output:", err)
+			b = orig
 		}
-		_, err = os.Stdout.Write(b)
+		switch i {
+		case 0:
+			err = ioutil.WriteFile("specialized.gen.go", b, 0644)
+		case 1:
+			err = ioutil.WriteFile("specialized.gen_test.go", b, 0644)
+		default:
+			panic("internal error: we have three packages somehow?")
+		}
 		if err != nil {
 			panic(err)
 		}
 	}
 }
 
+type PackageInfoSlice []*loader.PackageInfo
+
+func (s PackageInfoSlice) Sort()              { sort.Sort(s) }
+func (s PackageInfoSlice) Len() int           { return len(s) }
+func (s PackageInfoSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s PackageInfoSlice) Less(i, j int) bool { return s[i].Pkg.Path() < s[j].Pkg.Path() }
+
 var fcctx Context
 
 type FuncCall struct {
-	F    *ssa.Function
-	Call []types.Type
-	Ret  []types.Type
-	name string
+	F         *ssa.Function
+	Call      []types.Type
+	Ret       []types.Type
+	Unmangled bool
+	name      string
 }
 
 func mangle(buf []byte, s string) []byte {
@@ -142,14 +175,19 @@ func mangle(buf []byte, s string) []byte {
 }
 
 func (fc *FuncCall) Name() string {
+	sig := fc.F.Signature
+
 	if fc.name != "" {
 		return fc.name
 	}
 
-	sig := fc.F.Object().Type().(*types.Signature)
-
-	if name := fc.F.Name(); sig.Recv() == nil && (strings.HasPrefix(name, "Test") || strings.HasPrefix(name, "Benchmark") || strings.HasPrefix(name, "Example")) {
-		fc.name = name + "_Specialized"
+	if fc.Unmangled {
+		fc.name = fc.F.Name()
+		if recv := sig.Recv(); recv != nil {
+			fcctx.Reset()
+			fcctx.WriteType(recv.Type())
+			fc.name = "(" + fcctx.String() + ")." + fc.name
+		}
 		return fc.name
 	}
 
@@ -203,7 +241,7 @@ func (h *FuncCallHeap) Add(fc *FuncCall) { heap.Push(h, fc) }
 func (h *FuncCallHeap) Next() *FuncCall  { return heap.Pop(h).(*FuncCall) }
 
 func usesReflection(n *callgraph.Node, seen map[int]bool) bool {
-	if seen[n.ID] {
+	if n == nil || seen[n.ID] {
 		return false
 	}
 	seen[n.ID] = true
@@ -218,27 +256,14 @@ func usesReflection(n *callgraph.Node, seen map[int]bool) bool {
 	return false
 }
 
-func (ctx *Context) Analyze(f *ssa.Function) {
-	for _, b := range f.Blocks {
-		for _, instr := range b.Instrs {
-			if cc, ok := instr.(ssa.CallInstruction); ok {
-				c := cc.Common()
-				cf := c.StaticCallee()
-				if cf == nil {
-					continue
-				}
-				if usesReflection(ctx.RTA.CallGraph.Nodes[cf], make(map[int]bool)) {
-					continue
-				}
-				if call := ctx.shouldRewrite(cc, cf); call != nil {
-					ctx.Heap = append(ctx.Heap, call)
-				}
-			}
-		}
+func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function, seen map[ssa.CallInstruction]bool) *FuncCall {
+	if seen[cc] {
+		return nil
 	}
-}
-
-func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function) *FuncCall {
+	if usesReflection(ctx.RTA.CallGraph.Nodes[cf], make(map[int]bool)) {
+		//log.Println("ignoring because it uses reflection:", cf)
+		return nil
+	}
 	for _, b := range cf.Blocks {
 		for _, instr := range b.Instrs {
 			var f *types.Var
@@ -250,16 +275,57 @@ func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function) *Fun
 			}
 
 			if f != nil && f.Pkg() != ctx.Pkg && !f.Exported() {
+				//log.Println("ignoring due to unexported field access:", cf)
 				return nil // we can't do anything if there's an unexported field access.
 			}
 
-			// TODO(BenLubar): also handle unexported globals
+			var g *ssa.Global
+			switch i := instr.(type) {
+			case *ssa.UnOp:
+				g, _ = i.X.(*ssa.Global)
+			case *ssa.Store:
+				g, _ = i.Addr.(*ssa.Global)
+			}
+			if g != nil && g.Object().Pkg() != ctx.Pkg && !g.Object().Exported() {
+				//log.Println("ignoring due to unexported global access:", cf)
+				return nil
+			}
 		}
+	}
+
+	seen[cc] = true
+
+	anyInterface := false
+	for _, b := range cf.Blocks {
+		for _, instr := range b.Instrs {
+			if ccc, ok := instr.(ssa.CallInstruction); ok {
+				if f := ccc.Common().StaticCallee(); f != nil && ctx.shouldRewrite(ccc, f, seen) != nil {
+					anyInterface = true
+					break
+				}
+			}
+		}
+		if anyInterface {
+			break
+		}
+	}
+
+	if cc == nil {
+		if anyInterface {
+			return &FuncCall{F: cf, Unmangled: true}
+		}
+		//log.Println("ignoring because there is nothing to rewrite:", cf)
+		return nil
 	}
 
 	c := cc.Common()
 
-	anyInterface := false
+	if c.Signature().Variadic() {
+		// TODO(BenLubar): also support rewriting variadic functions
+		//log.Println("ignoring variadic function:", cf)
+		return nil
+	}
+
 	ret := c.Signature().Results()
 
 	call := &FuncCall{
@@ -279,11 +345,18 @@ func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function) *Fun
 		call.Call = append(call.Call, t)
 	}
 	if v, ok := cc.(ssa.Value); ok && ret.Len() > 0 {
-		ref := *v.Referrers()
-		if len(ref) > 0 {
-			if a, ok := ref[0].(*ssa.TypeAssert); ok && len(ref) == 1 && !a.CommaOk {
-				call.Ret = []types.Type{ctx.TypeOf(a)}
-			} else {
+		if t := ctx.TypeOf(v); ret.Len() == 1 && !types.Identical(t, v.Type()) {
+			call.Ret = []types.Type{t}
+			anyInterface = true
+		} else {
+			ref := *v.Referrers()
+			if len(ref) > 0 {
+				if a, ok := ref[0].(*ssa.TypeAssert); ok && len(ref) == 1 && !a.CommaOk {
+					call.Ret = []types.Type{ctx.TypeOf(a)}
+					anyInterface = true
+				}
+			}
+			if call.Ret == nil {
 				for i, l := 0, ret.Len(); i < l; i++ {
 					call.Ret = append(call.Ret, ret.At(i).Type())
 				}
@@ -294,6 +367,7 @@ func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function) *Fun
 	if anyInterface {
 		return call
 	}
+	//log.Println("ignoring non-interface function:", cf)
 	return nil
 }
 
@@ -316,18 +390,13 @@ func (ctx *Context) WriteName(val ssa.Value) {
 	case *ssa.Parameter:
 		ctx.WriteString("param_")
 		ctx.WriteString(v.Name())
-	case *ssa.Field:
-		if shouldSkipAnonymous(v) {
-			ctx.WriteName(v.X)
-		} else {
-			ctx.WriteString(v.Name())
+	case *ssa.Global:
+		if pkg := v.Object().Pkg(); pkg != ctx.Pkg {
+			ctx.Imports[pkg.Path()] = true
+			ctx.WriteString(pkg.Name())
+			ctx.WriteByte('.')
 		}
-	case *ssa.FieldAddr:
-		if shouldSkipAnonymous(v) {
-			ctx.WriteName(v.X)
-		} else {
-			ctx.WriteString(v.Name())
-		}
+		ctx.WriteString(v.Name())
 	default:
 		ctx.WriteString(v.Name())
 	}
@@ -336,7 +405,11 @@ func (ctx *Context) WriteName(val ssa.Value) {
 func (ctx *Context) WriteGoto(b *ssa.BasicBlock, succ int) {
 	for _, instr := range b.Succs[succ].Instrs {
 		if φ, ok := instr.(*ssa.Phi); ok {
-			ctx.WriteName(φ)
+			if len(*φ.Referrers()) == 0 {
+				ctx.WriteByte('_')
+			} else {
+				ctx.WriteName(φ)
+			}
 			ctx.WriteByte('=')
 			for j, p := range b.Succs[succ].Preds {
 				if p == b {
@@ -370,22 +443,19 @@ func field(typ types.Type, f int) *types.Var {
 	}
 }
 
-func shouldSkipAnonymous(instr ssa.Instruction) bool {
-	return false
-}
-
-func (ctx *Context) WriteCall(cc ssa.CallInstruction) {
+func (ctx *Context) WriteCall(cc ssa.CallInstruction) (specialized bool) {
 	c := cc.Common()
 
 	concrete := func(v *ssa.Function) {
-		if call := ctx.shouldRewrite(cc, v); call != nil {
+		if call := ctx.shouldRewrite(cc, v, make(map[ssa.CallInstruction]bool)); call != nil {
 			ctx.Heap.Add(call)
 			ctx.WriteString(call.Name())
+			specialized = true
 			return
 		}
 
 		if v.Parent() != nil {
-			panic("specialize: TODO: writeCall(inline)")
+			panic("specialize: TODO: WriteCall(inline)")
 		} else if recv := v.Signature.Recv(); recv != nil {
 			ctx.WriteByte('(')
 			ctx.WriteType(recv.Type())
@@ -420,7 +490,7 @@ func (ctx *Context) WriteCall(cc ssa.CallInstruction) {
 			ctx.WriteString(v.Name())
 
 		default:
-			panic("specialize: TODO: writeCall(value)")
+			panic("specialize: TODO: WriteCall(value)")
 		}
 	}
 	ctx.WriteByte('(')
@@ -433,7 +503,11 @@ func (ctx *Context) WriteCall(cc ssa.CallInstruction) {
 		}
 		ctx.WriteName(p)
 	}
+	if c.Signature().Variadic() {
+		ctx.WriteString("...")
+	}
 	ctx.WriteByte(')')
+	return
 }
 
 func (ctx *Context) TypeOf(v ssa.Value) types.Type {
@@ -450,12 +524,55 @@ func (ctx *Context) WriteTypeOf(v ssa.Value) {
 func Rewrite(ctx *Context) {
 	ctx.Type = make(map[ssa.Value]types.Type)
 
-	for i, p := range ctx.Call.F.Params {
-		ctx.Type[p] = ctx.Call.Call[i]
+	if !ctx.Call.Unmangled {
+		for i, p := range ctx.Call.F.Params {
+			ctx.Type[p] = ctx.Call.Call[i]
+		}
+
+		for _, b := range ctx.Call.F.Blocks {
+			if v, ok := b.Instrs[len(b.Instrs)-1].(*ssa.Return); ok {
+				for i, r := range v.Results {
+					ctx.Type[r] = ctx.Call.Ret[i]
+				}
+			}
+		}
 	}
 
 	for {
 		changed := false
+
+		for _, b := range ctx.Call.F.Blocks {
+			for _, instr := range b.Instrs {
+				if cc, ok := instr.(ssa.CallInstruction); ok {
+					c := cc.Common()
+					cf := c.StaticCallee()
+					if c.IsInvoke() {
+						cf = ctx.SSA.LookupMethod(ctx.TypeOf(c.Value), ctx.Pkg, c.Method.Name())
+					}
+					var fc *FuncCall
+					if cf != nil {
+						fc = ctx.shouldRewrite(cc, cf, make(map[ssa.CallInstruction]bool))
+					}
+
+					if fc != nil {
+						call := fc.Call
+						if c.IsInvoke() {
+							if !types.Identical(ctx.TypeOf(c.Value), call[0]) {
+								ctx.Type[c.Value] = call[0]
+								changed = true
+							}
+							call = call[1:]
+						}
+						for i, p := range call {
+							if !types.Identical(ctx.TypeOf(c.Args[i]), p) {
+								ctx.Type[c.Args[i]] = p
+								changed = true
+							}
+						}
+					}
+				}
+			}
+		}
 
 		if !changed {
 			break
@@ -463,34 +580,64 @@ func Rewrite(ctx *Context) {
 	}
 
 	ctx.WriteString("func ")
-	ctx.WriteString(ctx.Call.Name())
-	ctx.WriteByte('(')
-	for i, p := range ctx.Call.F.Params {
-		if i != 0 {
-			ctx.WriteByte(',')
+	if ctx.Call.Unmangled {
+		params := ctx.Call.F.Params
+		if ctx.Call.F.Signature.Recv() != nil {
+			ctx.WriteByte('(')
+			ctx.WriteName(params[0])
+			ctx.WriteByte(' ')
+			ctx.WriteTypeOf(params[0])
+			ctx.WriteByte(')')
+			params = params[1:]
 		}
-		ctx.WriteName(p)
-		ctx.WriteByte(' ')
-		ctx.WriteTypeOf(p)
-	}
-	ctx.WriteByte(')')
-	if len(ctx.Call.Ret) != 0 {
-		ctx.WriteString(" (")
-		for i, r := range ctx.Call.Ret {
+		ctx.WriteString(ctx.Call.F.Name())
+		ctx.WriteString("_Specialized(")
+		for i, p := range params {
 			if i != 0 {
 				ctx.WriteByte(',')
 			}
-			ctx.WriteType(r)
+			ctx.WriteName(p)
+			ctx.WriteByte(' ')
+			ctx.WriteTypeOf(p)
 		}
 		ctx.WriteByte(')')
+		if ctx.Call.F.Signature.Results().Len() != 0 {
+			ctx.WriteType(ctx.Call.F.Signature.Results())
+		}
+	} else {
+		ctx.WriteString(ctx.Call.Name())
+		ctx.WriteByte('(')
+		for i, p := range ctx.Call.F.Params {
+			if i != 0 {
+				ctx.WriteByte(',')
+			}
+			ctx.WriteName(p)
+			ctx.WriteByte(' ')
+			ctx.WriteTypeOf(p)
+		}
+		ctx.WriteByte(')')
+		if len(ctx.Call.Ret) != 0 {
+			ctx.WriteString(" (")
+			for i, r := range ctx.Call.Ret {
+				if i != 0 {
+					ctx.WriteByte(',')
+				}
+				ctx.WriteType(r)
+			}
+			ctx.WriteByte(')')
+		}
 	}
 	ctx.WriteString(" {\n")
 
 	ctx.WriteString("var (")
 	for _, b := range ctx.Call.F.Blocks {
 		for _, instr := range b.Instrs {
-			if v, ok := instr.(ssa.Value); ok && !shouldSkipAnonymous(instr) {
+			if v, ok := instr.(ssa.Value); ok {
 				name := v.Name()
+				if len(*v.Referrers()) == 0 {
+					// never used
+					continue
+				}
 				if t, ok := ctx.TypeOf(v).(*types.Tuple); ok {
 					if t.Len() == 0 {
 						// nothing
@@ -521,9 +668,13 @@ func Rewrite(ctx *Context) {
 	ctx.WriteString("\n)\n")
 
 	for _, b := range ctx.Call.F.Blocks {
-		ctx.WriteString("\nb")
+		ctx.WriteByte('\n')
+		if len(b.Preds) == 0 {
+			ctx.WriteString("//")
+		}
+		ctx.WriteByte('b')
 		ctx.WriteNumber(b.Index)
-		ctx.WriteString(":")
+		ctx.WriteByte(':')
 		if b.Comment != "" {
 			ctx.WriteString(" // ")
 			ctx.WriteString(b.Comment)
@@ -531,16 +682,18 @@ func Rewrite(ctx *Context) {
 		ctx.WriteByte('\n')
 		for _, instr := range b.Instrs {
 			if _, ok := instr.(*ssa.Phi); ok {
-				// handled in writeGoto
+				// handled in WriteGoto
 				continue
 			}
 
-			if shouldSkipAnonymous(instr) {
-				continue
-			}
+			handledTypeChange := false
 
 			if v, ok := instr.(ssa.Value); ok {
 				name := v.Name()
+				if r := v.Referrers(); r != nil && len(*r) == 0 {
+					name = "_"
+				}
+
 				if t, ok := ctx.TypeOf(v).(*types.Tuple); ok {
 					if t.Len() == 0 {
 						// nothing
@@ -553,8 +706,10 @@ func Rewrite(ctx *Context) {
 								ctx.WriteByte(',')
 							}
 							ctx.WriteString(name)
-							ctx.WriteByte('_')
-							ctx.WriteNumber(i)
+							if name != "_" {
+								ctx.WriteByte('_')
+								ctx.WriteNumber(i)
+							}
 						}
 						ctx.WriteByte('=')
 					}
@@ -580,7 +735,7 @@ func Rewrite(ctx *Context) {
 				ctx.WriteName(i.Y)
 
 			case *ssa.Call:
-				ctx.WriteCall(i)
+				handledTypeChange = ctx.WriteCall(i)
 
 			case *ssa.ChangeInterface:
 				ctx.WriteByte('(')
@@ -676,6 +831,7 @@ func Rewrite(ctx *Context) {
 				ctx.WriteString(")(")
 				ctx.WriteName(i.X)
 				ctx.WriteByte(')')
+				handledTypeChange = true
 
 			case *ssa.MakeMap:
 				ctx.WriteString("make(")
@@ -754,16 +910,29 @@ func Rewrite(ctx *Context) {
 
 			case *ssa.TypeAssert:
 				ctx.WriteName(i.X)
-				ctx.WriteString(".(")
-				ctx.WriteType(i.AssertedType)
-				ctx.WriteByte(')')
+				if !types.Identical(ctx.TypeOf(i.X), ctx.TypeOf(i)) {
+					ctx.WriteString(".(")
+					ctx.WriteType(i.AssertedType)
+					ctx.WriteByte(')')
+				}
+				handledTypeChange = true
 
 			case *ssa.UnOp:
-				ctx.WriteString(i.Op.String())
+				if _, ok := i.X.(*ssa.Global); !ok || i.Op != token.MUL {
+					ctx.WriteString(i.Op.String())
+				}
 				ctx.WriteName(i.X)
 
 			default:
 				panic("unreachable")
+			}
+
+			if v, ok := instr.(ssa.Value); ok && !handledTypeChange {
+				if t := ctx.TypeOf(v); !types.Identical(t, v.Type()) {
+					ctx.WriteString(".(")
+					ctx.WriteType(t)
+					ctx.WriteByte(')')
+				}
 			}
 			ctx.WriteByte('\n')
 		}

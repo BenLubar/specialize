@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"strconv"
 
 	"golang.org/x/tools/go/types"
@@ -176,6 +177,7 @@ func (ctx *Context) writeType(typ types.Type, visited []types.Type) {
 		ctx.WriteString(s)
 
 	default:
+		log.Panicf("%#v", t)
 		panic("unreachable")
 		//	// For externally defined implementations of Type.
 		//	ctx.WriteString(t.String())

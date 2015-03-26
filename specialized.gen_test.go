@@ -724,14 +724,14 @@ func specialized_main__pmain_dIntSlice_dPush_a_pmain_dIntSlice_aint(param_s *mai
 func specialized_main__pmain_dIntSlice_dRemove_a_pmain_dIntSlice_rint(param_s *main.IntSlice) int {
 	var (
 		t0 *main.IntSlice
-		t1 interface{}
+		t1 int
 		t2 int
 	)
 
 	//b0: // entry
 	t0 = (*main.IntSlice)(param_s)
 	t1 = specialized_heap_Pop_a_pmain_dIntSlice_rint(t0)
-	t2 = t1.(int)
+	t2 = t1
 	return t2
 }
 

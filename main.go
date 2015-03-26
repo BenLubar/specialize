@@ -569,6 +569,12 @@ func Rewrite(ctx *Context) {
 								changed = true
 							}
 						}
+						if v, ok := cc.(ssa.Value); ok && len(fc.Ret) == 1 {
+							if !types.Identical(ctx.TypeOf(v), fc.Ret[0]) {
+								ctx.Type[v] = fc.Ret[0]
+								changed = true
+							}
+						}
 					}
 				}
 			}

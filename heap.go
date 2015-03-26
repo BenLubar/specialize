@@ -16,6 +16,6 @@ func (s *IntSlice) Pop() (v interface{}) {
 	return
 }
 
-func (s *IntSlice) Init()       { heap.Init(s) }
+func (s IntSlice) Init()        { heap.Init(&s) }
 func (s *IntSlice) Add(i int)   { heap.Push(s, i) }
 func (s *IntSlice) Remove() int { return heap.Pop(s).(int) }

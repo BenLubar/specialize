@@ -84,7 +84,7 @@ func main() {
 		fcctx.Pkg = ipkg.Pkg
 
 		for _, f := range functions {
-			if call := ctx.shouldRewrite(nil, f, make(map[ssa.CallInstruction]bool)); call != nil {
+			if call, should := ctx.ShouldRewrite(nil, f); should {
 				ctx.Heap = append(ctx.Heap, call)
 			}
 		}
@@ -250,23 +250,31 @@ func usesReflection(n *callgraph.Node, seen map[int]bool) bool {
 	}
 	seen[n.ID] = true
 	if n.Func.Package() != nil && n.Func.Package().Object.Path() == "reflect" {
+		//log.Println("uses reflection:", n)
 		return true
 	}
 	for _, e := range n.Out {
 		if usesReflection(e.Callee, seen) {
+			//log.Println("uses reflection:", n)
 			return true
 		}
 	}
 	return false
 }
 
-func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function, seen map[ssa.CallInstruction]bool) *FuncCall {
-	if seen[cc] {
-		return nil
-	}
+type funccall_ok struct {
+	call   *FuncCall
+	should bool
+}
+
+func (ctx *Context) ShouldRewrite(cc ssa.CallInstruction, cf *ssa.Function) (call *FuncCall, should bool) {
+	return ctx.shouldRewrite(cc, cf, make(map[ssa.CallInstruction]funccall_ok))
+}
+
+func (ctx *Context) canRewrite(cf *ssa.Function, seen map[ssa.CallInstruction]funccall_ok) bool {
 	if usesReflection(ctx.RTA.CallGraph.Nodes[cf], make(map[int]bool)) {
 		//log.Println("ignoring because it uses reflection:", cf)
-		return nil
+		return false
 	}
 	for _, b := range cf.Blocks {
 		for _, instr := range b.Instrs {
@@ -280,46 +288,68 @@ func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function, seen
 
 			if f != nil && f.Pkg() != ctx.Pkg && !f.Exported() {
 				//log.Println("ignoring due to unexported field access:", cf)
-				return nil // we can't do anything if there's an unexported field access.
+				return false // we can't do anything if there's an unexported field access.
 			}
 
-			var g *ssa.Global
-			switch i := instr.(type) {
-			case *ssa.UnOp:
-				g, _ = i.X.(*ssa.Global)
-			case *ssa.Store:
-				g, _ = i.Addr.(*ssa.Global)
+			for _, v := range instr.Operands(nil) {
+				if g, ok := (*v).(*ssa.Global); ok && g.Object().Pkg() != ctx.Pkg && !g.Object().Exported() {
+					//log.Println("ignoring due to unexported global access:", cf)
+					return false
+				}
 			}
-			if g != nil && g.Object().Pkg() != ctx.Pkg && !g.Object().Exported() {
-				//log.Println("ignoring due to unexported global access:", cf)
-				return nil
+
+			if cc, ok := instr.(ssa.CallInstruction); ok {
+				if ccf := cc.Common().StaticCallee(); ccf != nil {
+					if ccf.Object().Pkg() != ctx.Pkg && !ccf.Object().Exported() {
+						if can, _ := ctx.shouldRewrite(cc, ccf, seen); can == nil {
+							//log.Println("ignoring due to unexported function call:", cf)
+							return false
+						}
+					}
+				}
+			}
+
+			if _, ok := instr.(*ssa.Range); ok {
+				//log.Println("ignoring due to range over a string or map:", cf)
+				return false
 			}
 		}
 	}
+	return true
+}
 
-	seen[cc] = true
+func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function, seen map[ssa.CallInstruction]funccall_ok) (*FuncCall, bool) {
+	if v, ok := seen[cc]; ok {
+		return v.call, v.should
+	}
 
-	anyInterface := false
+	seen[cc] = funccall_ok{nil, false}
+
+	if !ctx.canRewrite(cf, seen) {
+		seen[cc] = funccall_ok{nil, false}
+		return nil, false
+	}
+
+	anyInterface := cf.Object().Pkg() != ctx.Pkg && !cf.Object().Exported()
 	for _, b := range cf.Blocks {
-		for _, instr := range b.Instrs {
-			if ccc, ok := instr.(ssa.CallInstruction); ok {
-				if f := ccc.Common().StaticCallee(); f != nil && ctx.shouldRewrite(ccc, f, seen) != nil {
-					anyInterface = true
-					break
-				}
-			}
-		}
 		if anyInterface {
 			break
+		}
+		for _, instr := range b.Instrs {
+			if ccc, ok := instr.(ssa.CallInstruction); ok {
+				if f := ccc.Common().StaticCallee(); f != nil {
+					if _, should := ctx.shouldRewrite(ccc, f, seen); should {
+						anyInterface = true
+						break
+					}
+				}
+			}
 		}
 	}
 
 	if cc == nil {
-		if anyInterface {
-			return &FuncCall{F: cf, Unmangled: true}
-		}
-		//log.Println("ignoring because there is nothing to rewrite:", cf)
-		return nil
+		seen[cc] = funccall_ok{&FuncCall{F: cf, Unmangled: true}, anyInterface}
+		return &FuncCall{F: cf, Unmangled: true}, anyInterface
 	}
 
 	c := cc.Common()
@@ -327,7 +357,8 @@ func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function, seen
 	if c.Signature().Variadic() {
 		// TODO(BenLubar): also support rewriting variadic functions
 		//log.Println("ignoring variadic function:", cf)
-		return nil
+		seen[cc] = funccall_ok{nil, false}
+		return nil, false
 	}
 
 	ret := c.Signature().Results()
@@ -368,11 +399,8 @@ func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function, seen
 		}
 	}
 
-	if anyInterface {
-		return call
-	}
-	//log.Println("ignoring non-interface function:", cf)
-	return nil
+	seen[cc] = funccall_ok{call, anyInterface}
+	return call, anyInterface
 }
 
 func (ctx *Context) WriteNumber(n int) {
@@ -451,7 +479,7 @@ func (ctx *Context) WriteCall(cc ssa.CallInstruction) (specialized bool) {
 	c := cc.Common()
 
 	concrete := func(v *ssa.Function) {
-		if call := ctx.shouldRewrite(cc, v, make(map[ssa.CallInstruction]bool)); call != nil {
+		if call, should := ctx.ShouldRewrite(cc, v); should {
 			ctx.Heap.Add(call)
 			ctx.WriteString(call.Name())
 			specialized = true
@@ -518,7 +546,7 @@ func (ctx *Context) TypeOf(v ssa.Value) types.Type {
 	if t, ok := ctx.Type[v]; ok {
 		return t
 	}
-	return v.Type()
+	return ssa.DefaultType(v.Type())
 }
 
 func (ctx *Context) WriteTypeOf(v ssa.Value) {
@@ -554,11 +582,12 @@ func Rewrite(ctx *Context) {
 						cf = ctx.SSA.LookupMethod(ctx.TypeOf(c.Value), ctx.Pkg, c.Method.Name())
 					}
 					var fc *FuncCall
+					var should bool
 					if cf != nil {
-						fc = ctx.shouldRewrite(cc, cf, make(map[ssa.CallInstruction]bool))
+						fc, should = ctx.ShouldRewrite(cc, cf)
 					}
 
-					if fc != nil {
+					if should {
 						call := fc.Call
 						if c.IsInvoke() {
 							if !types.Identical(ctx.TypeOf(c.Value), call[0]) {

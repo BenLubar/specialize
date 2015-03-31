@@ -3,13 +3,16 @@ package main
 import (
 	"bytes"
 	"container/heap"
+	"go/ast"
 	"go/build"
 	"go/format"
+	"go/parser"
 	"go/token"
 	"io/ioutil"
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode"
 
 	"golang.org/x/tools/go/callgraph"
@@ -40,6 +43,7 @@ func main() {
 	bctx := build.Default
 	bctx.BuildTags = append(bctx.BuildTags, "no_specialized")
 	conf.Build = &bctx
+	conf.ParserMode |= parser.ParseComments
 
 	conf.ImportWithTests(".")
 
@@ -920,6 +924,8 @@ func Rewrite(ctx *Context) {
 					ctx.WriteString(".(")
 					ctx.WriteType(i.AssertedType)
 					ctx.WriteByte(')')
+				} else if i.CommaOk {
+					ctx.WriteString(",true")
 				}
 				handledTypeChange = true
 
@@ -941,6 +947,25 @@ func Rewrite(ctx *Context) {
 				}
 			}
 			ctx.WriteByte('\n')
+		}
+	}
+
+	// put the Output: comment back in for Example tests.
+	if ctx.Call.Unmangled && strings.HasPrefix(ctx.Call.Name(), "Example") && len(ctx.Call.F.Params) == 0 {
+		syntax := ctx.Call.F.Syntax()
+		_, path, _ := iprog.PathEnclosingInterval(syntax.Pos(), syntax.End())
+
+		decl := path[0].(*ast.FuncDecl)
+		file := path[1].(*ast.File)
+		comments := file.Comments
+		for _, cg := range comments {
+			if text := cg.Text(); cg.Pos() > decl.Pos() && cg.End() < decl.End() && strings.HasPrefix(text, "Output:") {
+				for _, l := range strings.Split(text, "\n") {
+					ctx.WriteString("// ")
+					ctx.WriteString(l)
+					ctx.WriteByte('\n')
+				}
+			}
 		}
 	}
 

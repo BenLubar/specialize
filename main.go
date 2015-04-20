@@ -73,6 +73,10 @@ func main() {
 				for i, l := 0, ms.Len(); i < l; i++ {
 					functions = append(functions, prog.Method(ms.At(i)))
 				}
+				ms = prog.MethodSets.MethodSet(types.NewPointer(t.Type()))
+				for i, l := 0, ms.Len(); i < l; i++ {
+					functions = append(functions, prog.Method(ms.At(i)))
+				}
 			}
 		}
 

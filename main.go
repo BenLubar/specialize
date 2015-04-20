@@ -22,6 +22,8 @@ import (
 	"golang.org/x/tools/go/types"
 )
 
+const debug = false
+
 var iprog *loader.Program
 
 type Context struct {
@@ -103,7 +105,9 @@ func main() {
 			}
 			seen[ctx.Call.Name()] = true
 
-			//log.Println(ctx.Call.Name())
+			if debug {
+				log.Println(ctx.Call.Name())
+			}
 			Rewrite(&ctx)
 		}
 
@@ -254,12 +258,16 @@ func usesReflection(n *callgraph.Node, seen map[int]bool) bool {
 	}
 	seen[n.ID] = true
 	if n.Func.Package() != nil && n.Func.Package().Object.Path() == "reflect" {
-		//log.Println("uses reflection:", n)
+		if debug {
+			log.Println("uses reflection:", n)
+		}
 		return true
 	}
 	for _, e := range n.Out {
 		if usesReflection(e.Callee, seen) {
-			//log.Println("uses reflection:", n)
+			if debug {
+				log.Println("uses reflection:", n)
+			}
 			return true
 		}
 	}
@@ -276,8 +284,16 @@ func (ctx *Context) ShouldRewrite(cc ssa.CallInstruction, cf *ssa.Function) (cal
 }
 
 func (ctx *Context) canRewrite(cf *ssa.Function, seen map[ssa.CallInstruction]funccall_ok) bool {
+	if cf.Synthetic != "" {
+		if debug {
+			log.Println("ignoring because it is a "+cf.Synthetic+":", cf)
+		}
+		return false
+	}
 	if usesReflection(ctx.RTA.CallGraph.Nodes[cf], make(map[int]bool)) {
-		//log.Println("ignoring because it uses reflection:", cf)
+		if debug {
+			log.Println("ignoring because it uses reflection:", cf)
+		}
 		return false
 	}
 	for _, b := range cf.Blocks {
@@ -291,13 +307,17 @@ func (ctx *Context) canRewrite(cf *ssa.Function, seen map[ssa.CallInstruction]fu
 			}
 
 			if f != nil && f.Pkg() != ctx.Pkg && !f.Exported() {
-				//log.Println("ignoring due to unexported field access:", cf)
+				if debug {
+					log.Println("ignoring due to unexported field access:", cf)
+				}
 				return false // we can't do anything if there's an unexported field access.
 			}
 
 			for _, v := range instr.Operands(nil) {
 				if g, ok := (*v).(*ssa.Global); ok && g.Object().Pkg() != ctx.Pkg && !g.Object().Exported() {
-					//log.Println("ignoring due to unexported global access:", cf)
+					if debug {
+						log.Println("ignoring due to unexported global access:", cf)
+					}
 					return false
 				}
 			}
@@ -306,7 +326,9 @@ func (ctx *Context) canRewrite(cf *ssa.Function, seen map[ssa.CallInstruction]fu
 				if ccf := cc.Common().StaticCallee(); ccf != nil {
 					if ccf.Object().Pkg() != ctx.Pkg && !ccf.Object().Exported() {
 						if can, _ := ctx.shouldRewrite(cc, ccf, seen); can == nil {
-							//log.Println("ignoring due to unexported function call:", cf)
+							if debug {
+								log.Println("ignoring due to unexported function call:", cf)
+							}
 							return false
 						}
 					}
@@ -314,7 +336,9 @@ func (ctx *Context) canRewrite(cf *ssa.Function, seen map[ssa.CallInstruction]fu
 			}
 
 			if _, ok := instr.(*ssa.Range); ok {
-				//log.Println("ignoring due to range over a string or map:", cf)
+				if debug {
+					log.Println("ignoring due to range over a string or map:", cf)
+				}
 				return false
 			}
 		}
@@ -360,7 +384,9 @@ func (ctx *Context) shouldRewrite(cc ssa.CallInstruction, cf *ssa.Function, seen
 
 	if c.Signature().Variadic() {
 		// TODO(BenLubar): also support rewriting variadic functions
-		//log.Println("ignoring variadic function:", cf)
+		if debug {
+			log.Println("ignoring variadic function:", cf)
+		}
 		seen[cc] = funccall_ok{nil, false}
 		return nil, false
 	}
